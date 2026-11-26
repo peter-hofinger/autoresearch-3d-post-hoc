@@ -43,7 +43,7 @@ uv run train.py --visual-audit visuals/smoke
 
 # 4. Full SAGE-10k + Déjà View + Semantics preparation (one-time)
 rm -rf ~/.cache/autoresearch-3d   # clear synthetic cache first if step 3 was run
-uv run huggingface-cli login
+uv run hf auth login
 uv run prepare.py --pareto-ks     # caches K in {4, 8, 12, 16} for Milestone 4 Pareto curve
 
 # 5. Manually verify raw Déjà View baseline (reports val_score: 1.000000)

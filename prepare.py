@@ -844,52 +844,117 @@ def generate_synthetic_dataset(num_dev: int = 4, num_val: int = 2, num_test: int
 # Stage 2 & 3: Sequential Déjà View + Semantic Model Caching (RTX 3080-Safe)
 # ---------------------------------------------------------------------------
 
+def _set_dvlt_loop_count(model: Any, k: int) -> dict[str, Any]:
+    """Return predict() kwargs or update model loop-iteration attribute for K-scaling."""
+    predict_fn = getattr(model, "predict", model.forward)
+    sig_params = set(inspect.signature(predict_fn).parameters.keys())
+    for name in ("num_iters", "num_loops", "n_iters", "n_loops", "K", "steps"):
+        if name in sig_params:
+            return {name: k}
+    # Otherwise inspect common loop attributes on model or nested submodules
+    for obj in (model, getattr(model, "aggregator", None), getattr(model, "transformer", None), getattr(model, "model", None)):
+        if obj is None:
+            continue
+        for attr in ("num_iters", "num_loops", "n_iters", "n_loops", "test_iters", "eval_iters", "num_steps", "K"):
+            if hasattr(obj, attr) and isinstance(getattr(obj, attr), int):
+                setattr(obj, attr, int(k))
+                return {}
+    return {}
+
+
 def _parse_dvlt_out(outputs: Any, N: int, hw: tuple[int, int]) -> dict[str, np.ndarray | None]:
     d = outputs if isinstance(outputs, dict) else vars(outputs)
 
     def _get(keys):
         for k in keys:
             if k in d and d[k] is not None:
-                v = d[k][-1] if isinstance(d[k], (list, tuple)) else d[k]
-                return v[0] if (v.ndim >= 3 and v.shape[0] == 1 and v.shape[1] == N) else v
+                v = d[k]
+                if isinstance(v, (list, tuple)):
+                    v = v[0] if len(v) == 1 else v[-1]
+                if torch.is_tensor(v) and v.ndim >= 3 and v.shape[0] == 1 and v.shape[1] == N:
+                    v = v[0]
+                return v
         return None
 
-    depth = _get(("depth", "pred_depth", "depths", "depth_map"))
+    depth = _get(("depths", "depth", "pred_depth", "depth_map"))
     assert depth is not None, f"Depth missing in DVLT outputs: {list(d.keys())}"
-    depth = depth.float().squeeze(-1) if (depth.ndim == 4 and depth.shape[-1] == 1) else (depth.float().squeeze(1) if depth.ndim == 4 else depth.float())
-    if depth.shape[-2:] != hw:
-        depth = F.interpolate(depth.unsqueeze(1), size=hw, mode="bilinear", align_corners=False).squeeze(1)
+    depth = depth.float()
+    if depth.ndim == 4 and depth.shape[-1] == 1:
+        depth = depth[..., 0]
+    elif depth.ndim == 4 and depth.shape[1] == 1:
+        depth = depth[:, 0]
+    h_pred, w_pred = int(depth.shape[-2]), int(depth.shape[-1])
+    h_tgt, w_tgt = hw
+    if (h_pred, w_pred) != (h_tgt, w_tgt):
+        depth = F.interpolate(depth.unsqueeze(1), size=(h_tgt, w_tgt), mode="bilinear", align_corners=False).squeeze(1)
 
-    conf = _get(("conf", "confidence", "depth_conf", "pred_conf"))
+    conf = _get(("depth_confs", "depth_conf", "confs", "conf", "confidence", "pred_conf"))
     if conf is not None:
-        conf = conf.float().squeeze(-1) if (conf.ndim == 4 and conf.shape[-1] == 1) else (conf.float().squeeze(1) if conf.ndim == 4 else conf.float())
-        if conf.shape[-2:] != hw:
-            conf = F.interpolate(conf.unsqueeze(1), size=hw, mode="bilinear", align_corners=False).squeeze(1)
+        conf = conf.float()
+        if conf.ndim == 4 and conf.shape[-1] == 1:
+            conf = conf[..., 0]
+        elif conf.ndim == 4 and conf.shape[1] == 1:
+            conf = conf[:, 0]
+        if conf.shape[-2:] != (h_tgt, w_tgt):
+            conf = F.interpolate(conf.unsqueeze(1), size=(h_tgt, w_tgt), mode="bilinear", align_corners=False).squeeze(1)
     else:
         conf = torch.ones_like(depth)
 
-    poses = _get(("poses", "extrinsics", "camera_poses", "c2w", "pred_poses"))
+    # Extract OpenCV c2w poses & intrinsics from DVLT Cameras object or direct tensors
+    poses = None
+    K = None
+    cams = d.get("cameras", None)
+    if cams is not None:
+        cam_obj = cams[0] if isinstance(cams, (list, tuple)) else cams
+        if hasattr(cam_obj, "camera_to_worlds"):
+            poses = cam_obj.camera_to_worlds
+        if hasattr(cam_obj, "get_intrinsics_matrices"):
+            K = cam_obj.get_intrinsics_matrices()
+        elif hasattr(cam_obj, "intrinsics"):
+            K = cam_obj.intrinsics
+
+    if poses is None:
+        poses = _get(("poses", "extrinsics", "camera_poses", "c2w", "pred_poses"))
     if poses is not None:
         poses = poses.float()
+        if poses.ndim == 4 and poses.shape[0] == 1:
+            poses = poses[0]
         if poses.shape[-2:] == (3, 4):
-            pad = torch.zeros(N, 1, 4, device=poses.device, dtype=poses.dtype)
+            pad = torch.zeros(poses.shape[0], 1, 4, device=poses.device, dtype=poses.dtype)
             pad[:, 0, 3] = 1.0
             poses = torch.cat([poses, pad], dim=1)
         poses_np = poses.detach().cpu().numpy().astype(np.float32)
     else:
         poses_np = np.repeat(np.eye(4, dtype=np.float32)[None], N, axis=0)
 
-    K = _get(("intrinsics", "K", "pred_intrinsics", "camera_intrinsics"))
+    if K is None:
+        K = _get(("intrinsics", "K", "pred_intrinsics", "camera_intrinsics"))
+    if K is not None:
+        K = K.float()
+        if K.ndim == 4 and K.shape[0] == 1:
+            K = K[0]
+        K_np = K.detach().cpu().numpy().astype(np.float32).copy()
+        # Rescale intrinsics cleanly if DVLT ran at (h_pred, w_pred) != (h_tgt, w_tgt)
+        if (h_pred, w_pred) != (h_tgt, w_tgt):
+            sx, sy = w_tgt / max(w_pred, 1), h_tgt / max(h_pred, 1)
+            K_np[:, 0, 0] *= sx
+            K_np[:, 0, 2] *= sx
+            K_np[:, 1, 1] *= sy
+            K_np[:, 1, 2] *= sy
+    else:
+        K_np = None
+
     return {
         "depth": depth.detach().cpu().numpy().astype(np.float32),
         "conf": conf.detach().cpu().numpy().astype(np.float32),
         "poses": poses_np,
-        "intrinsics": K.float().detach().cpu().numpy().astype(np.float32) if K is not None else None,
+        "intrinsics": K_np,
     }
 
 
 def cache_dvlt_predictions(splits: dict[str, Any], ks: tuple[int, ...] = (DVLT_DEFAULT_K,)) -> None:
     assert torch is not None and torch.cuda.is_available(), "CUDA required for Déjà View."
+    from accelerate import Accelerator
     from dvlt.model.dvlt.model import DVLT
     from dvlt.util.preprocess import load_sequence, preprocess_images
 
@@ -899,27 +964,32 @@ def cache_dvlt_predictions(splits: dict[str, Any], ks: tuple[int, ...] = (DVLT_D
         return
 
     print(f"[Stage 2] Loading {DVLT_REPO_ID} on CUDA...")
-    dev = torch.device("cuda")
-    model = DVLT.from_pretrained(DVLT_REPO_ID).to(dev).eval()
-    k_kw = next((n for n in ("K", "num_iters", "num_loops", "n_iters", "steps") if n in inspect.signature(model.forward).parameters), None)
+    accelerator = Accelerator(mixed_precision="bf16")
+    dvlt_img_size = 504
+    model = DVLT(img_size=dvlt_img_size)
+    model.load_pretrained(DVLT_REPO_ID)
+    model.setup_test(accelerator)
 
     for sid in scenes:
         sdir = SCENES_DIR / sid
         gt = dict(np.load(sdir / "gt.npz"))
         rgb = np.load(sdir / "rgb.npz")["rgb"]
         N, H, W, _ = rgb.shape
-        imgs, _ = load_sequence(str(sdir / "views"))
-        batch = preprocess_images(imgs)
-        batch = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in batch.items()} if isinstance(batch, dict) else batch.to(dev)
+        _, frames = load_sequence(str(sdir / "views"))
+        batch = preprocess_images(frames, img_size=dvlt_img_size, patch_size=14, device=accelerator.device)
 
         for k in ks:
             cpath = sdir / f"dvlt_k{k}.pt"
             if cpath.exists():
                 continue
+            extra_kw = _set_dvlt_loop_count(model, k)
             torch.cuda.synchronize()
             t0 = time.time()
-            with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out = model(batch, **({k_kw: k} if k_kw else {}))
+            with torch.no_grad(), accelerator.autocast():
+                if hasattr(model, "predict"):
+                    out = model.predict(batch, accelerator, **extra_kw)
+                else:
+                    out = model(batch, **extra_kw)
             torch.cuda.synchronize()
             dt = time.time() - t0
             parsed = _parse_dvlt_out(out, N, (H, W))
@@ -940,7 +1010,7 @@ def cache_dvlt_predictions(splits: dict[str, Any], ks: tuple[int, ...] = (DVLT_D
             }, cpath)
             print(f"[Stage 2] {sid} K={k}: {dt:.2f}s")
 
-    del model
+    del model, accelerator
     gc.collect()
     torch.cuda.empty_cache()
 
