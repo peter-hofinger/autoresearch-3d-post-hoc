@@ -1054,15 +1054,24 @@ def cache_predicted_semantics(splits: dict[str, Any]) -> None:
         t0 = time.time()
         for vi in range(N):
             out = sam(Image.fromarray(rgb[vi]), points_per_batch=64)
-            masks, scores = out.get("masks", []), out.get("scores", [])
-            order = sorted(range(len(masks)), key=lambda i: int(np.sum(masks[i])), reverse=True)
+            raw_masks = out.get("masks", [])
+            raw_scores = out.get("scores", [])
+            masks = [
+                m.detach().cpu().numpy().astype(bool) if torch.is_tensor(m) else np.asarray(m, dtype=bool)
+                for m in raw_masks
+            ]
+            scores = [
+                float(s.item()) if torch.is_tensor(s) else float(s)
+                for s in raw_scores
+            ]
+            order = sorted(range(len(masks)), key=lambda i: int(masks[i].sum()), reverse=True)
             imap, bacc = np.zeros((H, W), np.int16), np.zeros((H, W), np.float32)
             for nid, mi in enumerate(order, 1):
-                m = np.asarray(masks[mi], bool)
-                if m.shape != (H, W) or m.sum() < 16:
+                m = masks[mi]
+                if m.shape != (H, W) or int(m.sum()) < 16:
                     continue
                 imap[m] = min(nid, 32767)
-                sc_m = float(scores[mi]) if mi < len(scores) else 1.0
+                sc_m = scores[mi] if mi < len(scores) else 1.0
                 edge = (m != np.roll(m, 1, 1)) | (m != np.roll(m, 1, 0))
                 bacc = np.maximum(bacc, edge.astype(np.float32) * sc_m)
             s_inst[vi], s_bnd[vi] = imap, ndimage.gaussian_filter(bacc, 1.0).astype(np.float16)
@@ -1118,7 +1127,8 @@ def cache_predicted_semantics(splits: dict[str, Any]) -> None:
         t0 = time.time()
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
             inp = dproc(images=[Image.fromarray(rgb[vi]) for vi in range(N)], return_tensors="pt").to(dev)
-            ft = F.normalize(dmod(**inp, **dino_kw).last_hidden_state[:, 1:, :].float(), dim=-1)
+            n_patches = (H // 14) * (W // 14)
+            ft = F.normalize(dmod(**inp, **dino_kw).last_hidden_state[:, -n_patches:, :].float(), dim=-1)
             flat = ft.reshape(-1, ft.shape[-1])
             fc = flat - flat.mean(0, keepdim=True)
             _, _, V = torch.pca_lowrank(fc, q=min(DINO_PCA_DIM, flat.shape[-1]))
