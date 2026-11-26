@@ -846,13 +846,27 @@ def generate_synthetic_dataset(num_dev: int = 4, num_val: int = 2, num_test: int
 
 def _set_dvlt_loop_count(model: Any, k: int) -> dict[str, Any]:
     """Return predict() kwargs or update model loop-iteration attribute for K-scaling."""
-    predict_fn = getattr(model, "predict", model.forward)
-    sig_params = set(inspect.signature(predict_fn).parameters.keys())
-    for name in ("num_iters", "num_loops", "n_iters", "n_loops", "K", "steps"):
-        if name in sig_params:
-            return {name: k}
+    predict_fn = getattr(model, "predict", None) or getattr(model, "forward", None)
+    if predict_fn is not None:
+        sig_params = set(inspect.signature(predict_fn).parameters.keys())
+        for name in ("num_iters", "num_loops", "n_iters", "n_loops", "K", "steps"):
+            if name in sig_params:
+                return {name: k}
     # Otherwise inspect common loop attributes on model or nested submodules
-    for obj in (model, getattr(model, "aggregator", None), getattr(model, "transformer", None), getattr(model, "model", None)):
+    candidates = [
+        model,
+        getattr(model, "model", None),
+        getattr(model, "net", None),
+        getattr(model, "aggregator", None),
+        getattr(model, "transformer", None),
+    ]
+    for base in list(candidates):
+        if base is not None:
+            for sub_name in ("aggregator", "transformer", "backbone", "decoder"):
+                sub = getattr(base, sub_name, None)
+                if sub is not None:
+                    candidates.append(sub)
+    for obj in candidates:
         if obj is None:
             continue
         for attr in ("num_iters", "num_loops", "n_iters", "n_loops", "test_iters", "eval_iters", "num_steps", "K"):
