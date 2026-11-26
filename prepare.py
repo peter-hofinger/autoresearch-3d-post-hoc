@@ -20,6 +20,8 @@ import math
 import os
 import random
 import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -628,7 +630,39 @@ def _render_sage_scene_bpy(raw_dir: Path, out_dir: Path, cycles_samples: int = 2
 
 
 def render_sage_scenes(splits: dict[str, Any], cycles_samples: int = 24) -> None:
+    """
+    Render all uncached SAGE-10k scenes via headless Blender (bpy==4.3.0).
+    If bpy is not installed in the main venv (to avoid NumPy 1.x vs dvlt's NumPy 2.x ABI conflicts),
+    automatically runs Stage 1 in a self-contained isolated `uv run --with bpy==4.3.0` subprocess.
+    """
     scenes = splits["dev"] + splits["val"] + splits["test"]
+    pending = [s for s in scenes if not ((SCENES_DIR / s / "gt.npz").exists() and (SCENES_DIR / s / "rgb.npz").exists())]
+    if not pending:
+        print(f"[Stage 1] All {len(scenes)} SAGE-10k scenes already rendered.")
+        return
+
+    try:
+        import bpy  # noqa: F401
+        has_bpy = True
+    except ImportError:
+        has_bpy = False
+
+    if not has_bpy:
+        print(f"[Stage 1] Launching isolated uv Blender (bpy==4.3.0) worker for {len(pending)} scenes...")
+        cmd = [
+            "uv", "run", "--no-project", "--python", "3.11",
+            "--extra-index-url", "https://download.blender.org/pypi/",
+            "--with", "bpy==4.3.0",
+            "--with", "numpy<2",
+            "--with", "scipy",
+            "--with", "pillow",
+            str(Path(__file__).resolve()),
+            "--render-only",
+            "--cycles-samples", str(cycles_samples),
+        ]
+        subprocess.run(cmd, check=True)
+        return
+
     root = RAW_SAGE_DIR / "scenes" if (RAW_SAGE_DIR / "scenes").exists() else RAW_SAGE_DIR
     for i, sid in enumerate(scenes, 1):
         out_dir = SCENES_DIR / sid
@@ -1223,6 +1257,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-test", type=int, default=SPLIT_SIZES["test"])
     parser.add_argument("--pareto-ks", action="store_true", help="Cache DVLT for K in {4, 8, 12, 16}")
     parser.add_argument("--cycles-samples", type=int, default=24)
+    parser.add_argument("--render-only", action="store_true", help="Only run Stage 1 headless Blender rendering")
     parser.add_argument("--baselines-only", action="store_true")
     args = parser.parse_args()
 
@@ -1230,6 +1265,8 @@ if __name__ == "__main__":
     ks = DVLT_PARETO_KS if args.pareto_ks else (DVLT_DEFAULT_K,)
     if args.synthetic:
         generate_synthetic_dataset(args.num_dev, args.num_val, args.num_test)
+    elif args.render_only:
+        render_sage_scenes(json.loads(SPLITS_PATH.read_text()), cycles_samples=args.cycles_samples)
     elif args.baselines_only:
         compute_and_cache_baselines(json.loads(SPLITS_PATH.read_text()), ks=ks)
     else:
