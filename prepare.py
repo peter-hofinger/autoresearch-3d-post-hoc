@@ -19,10 +19,12 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -290,15 +292,10 @@ def compute_fixed_sim3(
     gt_depth: np.ndarray, gt_poses: np.ndarray, gt_K: np.ndarray,
 ) -> tuple[float, np.ndarray, np.ndarray]:
     """Compute ONE frozen Sim(3) transform mapping raw DVLT frame -> GT world frame."""
-    scale, R, t = umeyama_sim3(pred_poses[:, :3, 3], gt_poses[:, :3, 3], with_scale=True)
     valid = np.isfinite(pred_depth) & (pred_depth > 0.05) & np.isfinite(gt_depth) & (gt_depth > 0.05) & (gt_depth < TSDF_DEPTH_TRUNC)
-    if np.sum(valid) > 1000:
-        s_med = float(np.median(gt_depth[valid] / pred_depth[valid]))
-        if not np.isfinite(scale) or scale <= 1e-4 or abs(math.log(max(scale / max(s_med, 1e-6), 1e-6))) > 0.5:
-            scale = s_med
-            t = gt_poses[:, :3, 3].mean(axis=0) - scale * (R @ pred_poses[:, :3, 3].mean(axis=0))
+    s_med = float(np.median(gt_depth[valid] / pred_depth[valid])) if np.sum(valid) > 1000 else 1.0
 
-    # Trimmed Umeyama refinement on back-projected 3D correspondences (top 85% inliers)
+    # Sample up to 800 valid back-projected 3D point correspondences per view
     rng = np.random.default_rng(42)
     src_l, dst_l = [], []
     for i in range(gt_depth.shape[0]):
@@ -312,17 +309,30 @@ def compute_fixed_sim3(
         gw = np.stack([(xs - kg[0, 2]) * zg / kg[0, 0], (ys - kg[1, 2]) * zg / kg[1, 1], zg], -1) @ gt_poses[i, :3, :3].T + gt_poses[i, :3, 3]
         src_l.append(pw)
         dst_l.append(gw)
+
     if src_l:
         src_a, dst_a = np.concatenate(src_l), np.concatenate(dst_l)
-        errs = np.linalg.norm(scale * (src_a @ R.T) + t - dst_a, axis=-1)
-        inl = errs <= np.percentile(errs, 85)
-        if np.sum(inl) >= 50:
-            scale, R, t = umeyama_sim3(src_a[inl], dst_a[inl], with_scale=True)
+        if len(src_a) >= 3:
+            scale, R, t = umeyama_sim3(src_a, dst_a, with_scale=True)
+            for _ in range(2):
+                errs = np.linalg.norm(scale * (src_a @ R.T) + t - dst_a, axis=-1)
+                inl = errs <= np.percentile(errs, 80)
+                if np.sum(inl) >= 50:
+                    scale, R, t = umeyama_sim3(src_a[inl], dst_a[inl], with_scale=True)
+            if not np.isfinite(scale) or scale <= 1e-4:
+                scale = s_med
+            return float(scale), R.astype(np.float64), t.astype(np.float64)
+
+    # Fallback: camera-center Umeyama
+    scale, R, t = umeyama_sim3(pred_poses[:, :3, 3], gt_poses[:, :3, 3], with_scale=True)
+    if not np.isfinite(scale) or scale <= 1e-4 or abs(math.log(max(scale / max(s_med, 1e-6), 1e-6))) > 0.5:
+        scale = s_med
+        t = gt_poses[:, :3, 3].mean(axis=0) - scale * (R @ pred_poses[:, :3, 3].mean(axis=0))
     return float(scale), R.astype(np.float64), t.astype(np.float64)
 
 
 # ---------------------------------------------------------------------------
-# Stage 0 & 1: Selective SAGE-10k Download & Headless PBR Rendering (bpy 4.3)
+# Stage 0 & 1: Selective SAGE-10k Download, GLB Export & Headless PBR Render
 # ---------------------------------------------------------------------------
 
 def _look_at_c2w(eye: np.ndarray, target: np.ndarray) -> np.ndarray:
@@ -351,6 +361,10 @@ def _sample_cameras(bmin: np.ndarray, bmax: np.ndarray, n: int = NUM_VIEWS) -> n
     return np.stack(poses)
 
 
+def _strip_zip(name: str) -> str:
+    return name[:-4] if name.endswith(".zip") else name
+
+
 def download_sage_scenes(num_dev: int, num_val: int, num_test: int, local_sage_dir: str | None = None) -> dict[str, Any]:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     SCENES_DIR.mkdir(parents=True, exist_ok=True)
@@ -359,10 +373,10 @@ def download_sage_scenes(num_dev: int, num_val: int, num_test: int, local_sage_d
     if local_sage_dir is not None:
         base = Path(local_sage_dir)
         root = base / "scenes" if (base / "scenes").exists() else base
-        cands = sorted(p.name for p in root.iterdir() if p.is_dir())
+        cands = sorted(p.name for p in root.iterdir() if p.is_dir() or p.suffix == ".zip")
         assert len(cands) >= total, f"Need {total} scenes in {root}, found {len(cands)}."
         random.Random(42).shuffle(cands)
-        selected = cands[:total]
+        raw_selected = cands[:total]
         if not RAW_SAGE_DIR.exists():
             RAW_SAGE_DIR.symlink_to(base.resolve())
     else:
@@ -373,17 +387,35 @@ def download_sage_scenes(num_dev: int, num_val: int, num_test: int, local_sage_d
         cands = sorted(Path(e.path).name for e in entries if getattr(e, "path", "").startswith("scenes/"))
         assert len(cands) >= total, f"Found {len(cands)} scenes, need {total}."
         stride = max(1, len(cands) // total)
-        selected = list(dict.fromkeys(cands[min(i * stride, len(cands) - 1)] for i in range(total)))
+        raw_selected = list(dict.fromkeys(cands[min(i * stride, len(cands) - 1)] for i in range(total)))
         for c in cands:
-            if len(selected) >= total:
+            if len(raw_selected) >= total:
                 break
-            if c not in selected:
-                selected.append(c)
-        print(f"[Stage 0] Downloading {len(selected)} selected scenes -> {RAW_SAGE_DIR}")
+            if c not in raw_selected:
+                raw_selected.append(c)
+        print(f"[Stage 0] Downloading {len(raw_selected)} selected scenes -> {RAW_SAGE_DIR}")
+        allow_patterns = (
+            [f"scenes/{name}" for name in raw_selected]
+            + [f"scenes/{name}/**" for name in raw_selected]
+            + ["kits/**"]
+        )
         snapshot_download(
             repo_id=SAGE_REPO_ID, repo_type="dataset", local_dir=str(RAW_SAGE_DIR),
-            allow_patterns=[f"scenes/{sid}/**" for sid in selected] + ["kits/**"],
+            allow_patterns=allow_patterns,
         )
+
+    selected = [_strip_zip(name) for name in raw_selected]
+    unpacked_root = RAW_SAGE_DIR / "unpacked"
+    unpacked_root.mkdir(parents=True, exist_ok=True)
+    scenes_root = RAW_SAGE_DIR / "scenes" if (RAW_SAGE_DIR / "scenes").exists() else RAW_SAGE_DIR
+    for sid in selected:
+        zip_path = scenes_root / f"{sid}.zip"
+        dest_dir = unpacked_root / sid
+        if zip_path.exists() and not (dest_dir.exists() and any(dest_dir.iterdir())):
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(dest_dir)
+            print(f"[Stage 0] Unzipped {zip_path.name} -> {dest_dir}")
 
     splits = {
         "dev": selected[:num_dev],
@@ -396,14 +428,98 @@ def download_sage_scenes(num_dev: int, num_val: int, num_test: int, local_sage_d
     return splits
 
 
+def _extract_oracle_labels(obj: Any, out: dict[str, str]) -> None:
+    """Recursively collect {object_id/mesh_id: semantic_label} from SAGE-10k layout JSON."""
+    if isinstance(obj, dict):
+        lbl = obj.get("category") or obj.get("type") or obj.get("class") or obj.get("name")
+        if isinstance(lbl, str) and lbl.strip():
+            for id_key in ("id", "object_id", "source_id", "mesh_id"):
+                val = obj.get(id_key)
+                if val is not None and str(val).strip():
+                    out[str(val).strip()] = lbl.strip()
+        for v in obj.values():
+            _extract_oracle_labels(v, out)
+    elif isinstance(obj, list):
+        for item in obj:
+            _extract_oracle_labels(item, out)
+
+
+def export_sage_glbs(splits: dict[str, Any]) -> None:
+    """Stage 0b: Export each unpacked SAGE-10k scene to GLB via kits/export_glb.py and save oracle_labels.json."""
+    kits_dir = RAW_SAGE_DIR / "kits"
+    export_script = kits_dir / "export_glb.py"
+    assert export_script.exists(), f"Missing {export_script}; kits/ not downloaded."
+
+    scenes = splits["dev"] + splits["val"] + splits["test"]
+    for i, sid in enumerate(scenes, 1):
+        out_dir = SCENES_DIR / sid
+        out_dir.mkdir(parents=True, exist_ok=True)
+        unpacked_dir = RAW_SAGE_DIR / "unpacked" / sid
+        if not unpacked_dir.exists():
+            unpacked_dir = RAW_SAGE_DIR / "scenes" / sid
+
+        cands = sorted(unpacked_dir.rglob("*.json"), key=lambda p: p.stat().st_size, reverse=True)
+        assert cands, f"No layout JSON found under {unpacked_dir}"
+
+        layout_json = cands[0]
+        parsed_layout = None
+        for cand in cands:
+            try:
+                data = json.loads(cand.read_text())
+                if isinstance(data, dict) and ("rooms" in data or "objects" in data):
+                    layout_json = cand
+                    parsed_layout = data
+                    break
+            except Exception:
+                continue
+        if parsed_layout is None:
+            parsed_layout = json.loads(layout_json.read_text())
+
+        labels_path = out_dir / "oracle_labels.json"
+        if not labels_path.exists():
+            oracle_labels: dict[str, str] = {}
+            _extract_oracle_labels(parsed_layout, oracle_labels)
+            labels_path.write_text(json.dumps(oracle_labels, indent=2))
+
+        if not list(out_dir.glob("*.glb")):
+            t0 = time.time()
+            print(f"[Stage 0b] ({i}/{len(scenes)}) Exporting GLB for {sid} ({layout_json.name})...")
+            subprocess.run(
+                [sys.executable, str(export_script), str(layout_json), str(out_dir)],
+                cwd=str(kits_dir),
+                check=True,
+            )
+            print(f"           exported in {time.time() - t0:.1f}s")
+        assert list(out_dir.glob("*.glb")), f"export_glb.py produced no .glb in {out_dir}"
+
+
+def _resolve_mesh_label(mesh_name: str, oracle_labels: dict[str, str]) -> str:
+    clean = re.sub(r"\.\d+$", "", mesh_name)
+    if clean.startswith("mesh_"):
+        clean = clean[5:]
+    if clean in oracle_labels:
+        return oracle_labels[clean]
+    for obj_id, lbl in oracle_labels.items():
+        if obj_id and obj_id in clean:
+            return lbl
+    return clean
+
+
 def _render_sage_scene_bpy(raw_dir: Path, out_dir: Path, cycles_samples: int = 24) -> None:
     import bpy
-    from mathutils import Matrix, Quaternion, Vector
+    from mathutils import Matrix, Vector
     from PIL import Image
 
     out_dir.mkdir(parents=True, exist_ok=True)
     views_dir = out_dir / "views"
     views_dir.mkdir(exist_ok=True)
+
+    glbs = sorted(out_dir.glob("*.glb")) or sorted(raw_dir.glob("*.glb"))
+    if not glbs:
+        raise FileNotFoundError(f"No .glb found in {out_dir} or {raw_dir}. Run export_sage_glbs() first.")
+
+    labels_path = out_dir / "oracle_labels.json"
+    oracle_labels: dict[str, str] = json.loads(labels_path.read_text()) if labels_path.exists() else {}
 
     bpy.ops.wm.read_factory_settings(use_empty=True)
     sc = bpy.context.scene
@@ -433,128 +549,55 @@ def _render_sage_scene_bpy(raw_dir: Path, out_dir: Path, cycles_samples: int = 2
     bg = world.node_tree.nodes.get("Background")
     if bg:
         bg.inputs[0].default_value = (0.35, 0.35, 0.35, 1.0)
-        bg.inputs[1].default_value = 0.6
+        bg.inputs[1].default_value = 0.9
+
+    bpy.ops.import_scene.gltf(filepath=str(glbs[0]))
+    mesh_objs = [o for o in bpy.data.objects if o.type == "MESH"]
+    if len(mesh_objs) < 2:
+        raise RuntimeError(f"Expected >=2 mesh objects in {glbs[0]}, got {len(mesh_objs)}.")
+
+    # Auto-fix glTF Y-up vs Z-up orientation if floor lies in X-Z plane
+    floor_objs = [
+        o for o in mesh_objs
+        if "floor" in o.name.lower() or "floor" in _resolve_mesh_label(o.name, oracle_labels).lower()
+    ]
+    if floor_objs:
+        f_pts = np.asarray([list(o.matrix_world @ Vector(c)) for o in floor_objs for c in o.bound_box], dtype=np.float32)
+        ext_f = f_pts.max(axis=0) - f_pts.min(axis=0)
+        if ext_f[1] < 0.3 * max(float(ext_f[2]), 1e-6):
+            for o in bpy.data.objects:
+                if o.parent is None:
+                    o.rotation_euler[0] -= math.pi / 2.0
+            bpy.context.view_layer.update()
 
     inst_meta: dict[int, dict[str, Any]] = {}
     pid = 1
+    for o in mesh_objs:
+        label = _resolve_mesh_label(o.name, oracle_labels)
+        o.pass_index = pid
+        inst_meta[pid] = {"label": label, "struct_id": classify_label_to_struct(label)}
+        pid += 1
 
-    def _tag_new(existing: set[str], label: str) -> None:
-        nonlocal pid
-        hit = False
-        for o in bpy.data.objects:
-            if o.name not in existing and o.type == "MESH":
-                o.pass_index = pid
-                hit = True
-        if hit:
-            inst_meta[pid] = {"label": label, "struct_id": classify_label_to_struct(label)}
-            pid += 1
-
-    glbs = list(raw_dir.glob("*.glb"))
-    if glbs:
-        ex = {o.name for o in bpy.data.objects}
-        bpy.ops.import_scene.gltf(filepath=str(glbs[0]))
-        for o in bpy.data.objects:
-            if o.name not in ex and o.type == "MESH":
-                o.pass_index = pid
-                inst_meta[pid] = {"label": o.name, "struct_id": classify_label_to_struct(o.name)}
-                pid += 1
-    else:
-        jsons = sorted(raw_dir.glob("*.json"))
-        layout = json.loads(jsons[0].read_text()) if jsons else {}
-        rooms = layout.get("rooms", [layout["room"]] if "room" in layout else [])
-        dims = rooms[0].get("dimensions", {}) if rooms and isinstance(rooms[0], dict) else {}
-        rw = float(dims.get("width", dims.get("x", 5.0)))
-        rl = float(dims.get("length", dims.get("y", 5.0)))
-        rh = float(dims.get("height", dims.get("z", 2.8)))
-
-        def _box(name, loc, scale, col, lbl):
-            ex = {o.name for o in bpy.data.objects}
-            bpy.ops.mesh.primitive_cube_add(size=1.0, location=loc)
-            o = bpy.context.active_object
-            o.name, o.scale = name, scale
-            mat = bpy.data.materials.new(f"m_{name}")
-            mat.use_nodes = True
-            bsdf = mat.node_tree.nodes.get("Principled BSDF")
-            if bsdf:
-                bsdf.inputs["Base Color"].default_value = (*col, 1.0)
-                bsdf.inputs["Roughness"].default_value = 0.75
-            o.data.materials.append(mat)
-            _tag_new(ex, lbl)
-
-        _box("floor", (rw / 2, rl / 2, -0.05), (rw, rl, 0.1), (0.55, 0.45, 0.35), "floor")
-        _box("ceiling", (rw / 2, rl / 2, rh + 0.05), (rw, rl, 0.1), (0.88, 0.88, 0.86), "ceiling")
-        _box("wall_s", (rw / 2, -0.05, rh / 2), (rw, 0.1, rh), (0.82, 0.80, 0.76), "wall")
-        _box("wall_n", (rw / 2, rl + 0.05, rh / 2), (rw, 0.1, rh), (0.80, 0.82, 0.84), "wall")
-        _box("wall_w", (-0.05, rl / 2, rh / 2), (0.1, rl, rh), (0.84, 0.82, 0.78), "wall")
-        _box("wall_e", (rw + 0.05, rl / 2, rh / 2), (0.1, rl, rh), (0.78, 0.80, 0.82), "wall")
-
-        obj_dir = raw_dir / "objects"
-        entries = (rooms[0].get("objects", []) if rooms and isinstance(rooms[0], dict) else []) or layout.get("objects", [])
-        imported = set()
-        for e in entries:
-            if not isinstance(e, dict):
-                continue
-            lbl = e.get("category", e.get("class", e.get("type", e.get("name", "object"))))
-            oid = str(e.get("object_id", e.get("id", e.get("source_id", ""))))
-            mp = None
-            for key in ("model_path", "mesh_file"):
-                if e.get(key):
-                    for bd in (raw_dir, obj_dir):
-                        c = bd / str(e[key])
-                        if c.exists():
-                            mp = c
-                            break
-            if mp is None and obj_dir.exists() and oid:
-                for ext in (".glb", ".gltf", ".obj", ".ply"):
-                    hits = [obj_dir / f"{oid}{ext}"] if (obj_dir / f"{oid}{ext}").exists() else list(obj_dir.glob(f"*{oid}*{ext}"))
-                    if hits:
-                        mp = hits[0]
-                        break
-            if mp is None:
-                continue
-            imported.add(mp)
-            ex = {o.name for o in bpy.data.objects}
-            if mp.suffix in (".glb", ".gltf"):
-                bpy.ops.import_scene.gltf(filepath=str(mp))
-            elif mp.suffix == ".obj":
-                bpy.ops.wm.obj_import(filepath=str(mp))
-            elif mp.suffix == ".ply":
-                bpy.ops.wm.ply_import(filepath=str(mp))
-
-            pos, rot = e.get("position"), e.get("rotation")
-            loc = (float(pos["x"]), float(pos["y"]), float(pos["z"])) if isinstance(pos, dict) and {"x", "y", "z"}.issubset(pos) else (tuple(float(v) for v in pos) if isinstance(pos, (list, tuple)) and len(pos) == 3 else None)
-            erot, qrot = None, None
-            if isinstance(rot, dict):
-                erot = tuple(math.radians(float(rot.get(a, 0.0))) for a in ("x", "y", "z"))
-            elif isinstance(rot, (list, tuple)) and len(rot) == 3:
-                vals = [float(v) for v in rot]
-                erot = tuple(math.radians(v) for v in vals) if max(abs(v) for v in vals) > 6.4 else tuple(vals)
-            elif isinstance(rot, (list, tuple)) and len(rot) == 4:
-                qrot = Quaternion((float(rot[3]), float(rot[0]), float(rot[1]), float(rot[2])))
-
-            for o in bpy.data.objects:
-                if o.name not in ex and o.parent is None:
-                    if loc is not None:
-                        o.location = loc
-                    if qrot is not None:
-                        o.rotation_mode, o.rotation_quaternion = "QUATERNION", qrot
-                    elif erot is not None:
-                        o.rotation_euler = erot
-            _tag_new(ex, lbl)
-
-        if obj_dir.exists() and not imported:
-            for mp in sorted(obj_dir.glob("*.glb")):
-                ex = {o.name for o in bpy.data.objects}
-                bpy.ops.import_scene.gltf(filepath=str(mp))
-                _tag_new(ex, mp.stem)
-
-    corners = [list(o.matrix_world @ Vector(c)) for o in bpy.data.objects if o.type == "MESH" for c in o.bound_box]
-    arr = np.asarray(corners, np.float32) if corners else np.array([[0, 0, 0], [4, 4, 2.8]], np.float32)
+    # Compute room bounds from imported MESH world vertices (fallback to bbox corners)
+    verts_w = []
+    for o in mesh_objs:
+        mw = o.matrix_world
+        mesh_verts = o.data.vertices
+        if len(mesh_verts) > 0:
+            step = max(1, len(mesh_verts) // 512)
+            for idx_v in range(0, len(mesh_verts), step):
+                vc = mw @ mesh_verts[idx_v].co
+                verts_w.append([vc.x, vc.y, vc.z])
+        else:
+            for c in o.bound_box:
+                vc = mw @ Vector(c)
+                verts_w.append([vc.x, vc.y, vc.z])
+    arr = np.asarray(verts_w, np.float32)
     bmin, bmax = np.percentile(arr, 2, axis=0), np.percentile(arr, 98, axis=0)
     ctr = 0.5 * (bmin + bmax)
 
     ld = bpy.data.lights.new("Light", type="AREA")
-    ld.energy, ld.size = 180.0, 1.5
+    ld.energy, ld.size = 260.0, 2.0
     lo = bpy.data.objects.new("Light", ld)
     sc.collection.objects.link(lo)
     lo.location = (float(ctr[0]), float(ctr[1]), float(bmax[2] - 0.15))
@@ -663,15 +706,17 @@ def render_sage_scenes(splits: dict[str, Any], cycles_samples: int = 24) -> None
         subprocess.run(cmd, check=True)
         return
 
-    root = RAW_SAGE_DIR / "scenes" if (RAW_SAGE_DIR / "scenes").exists() else RAW_SAGE_DIR
     for i, sid in enumerate(scenes, 1):
         out_dir = SCENES_DIR / sid
         if (out_dir / "gt.npz").exists() and (out_dir / "rgb.npz").exists():
             print(f"[Stage 1] ({i}/{len(scenes)}) {sid}: cached.")
             continue
+        raw_dir = RAW_SAGE_DIR / "unpacked" / sid
+        if not raw_dir.exists():
+            raw_dir = RAW_SAGE_DIR / "scenes" / sid
         t0 = time.time()
         print(f"[Stage 1] ({i}/{len(scenes)}) Rendering {sid}...")
-        _render_sage_scene_bpy(root / sid, out_dir, cycles_samples=cycles_samples)
+        _render_sage_scene_bpy(raw_dir, out_dir, cycles_samples=cycles_samples)
         print(f"          rendered in {time.time() - t0:.1f}s")
 
 
@@ -845,34 +890,23 @@ def generate_synthetic_dataset(num_dev: int = 4, num_val: int = 2, num_test: int
 # ---------------------------------------------------------------------------
 
 def _set_dvlt_loop_count(model: Any, k: int) -> dict[str, Any]:
-    """Return predict() kwargs or update model loop-iteration attribute for K-scaling."""
-    predict_fn = getattr(model, "predict", None) or getattr(model, "forward", None)
-    if predict_fn is not None:
-        sig_params = set(inspect.signature(predict_fn).parameters.keys())
-        for name in ("num_iters", "num_loops", "n_iters", "n_loops", "K", "steps"):
-            if name in sig_params:
-                return {name: k}
-    # Otherwise inspect common loop attributes on model or nested submodules
-    candidates = [
-        model,
-        getattr(model, "model", None),
-        getattr(model, "net", None),
-        getattr(model, "aggregator", None),
-        getattr(model, "transformer", None),
-    ]
-    for base in list(candidates):
-        if base is not None:
-            for sub_name in ("aggregator", "transformer", "backbone", "decoder"):
-                sub = getattr(base, sub_name, None)
-                if sub is not None:
-                    candidates.append(sub)
-    for obj in candidates:
-        if obj is None:
+    """Explicitly update DVLT inference_steps on model and nested submodules (never num_steps)."""
+    updated = 0
+    seen: set[int] = set()
+    queue = [model]
+    while queue:
+        obj = queue.pop(0)
+        if obj is None or id(obj) in seen:
             continue
-        for attr in ("num_iters", "num_loops", "n_iters", "n_loops", "test_iters", "eval_iters", "num_steps", "K"):
-            if hasattr(obj, attr) and isinstance(getattr(obj, attr), int):
-                setattr(obj, attr, int(k))
-                return {}
+        seen.add(id(obj))
+        if hasattr(obj, "inference_steps"):
+            setattr(obj, "inference_steps", int(k))
+            updated += 1
+        for sub_name in ("model", "net", "aggregator", "transformer", "backbone", "decoder"):
+            sub = getattr(obj, sub_name, None)
+            if sub is not None and id(sub) not in seen:
+                queue.append(sub)
+    assert updated > 0, "Failed to locate 'inference_steps' attribute on DVLT model."
     return {}
 
 
@@ -979,7 +1013,7 @@ def cache_dvlt_predictions(splits: dict[str, Any], ks: tuple[int, ...] = (DVLT_D
 
     print(f"[Stage 2] Loading {DVLT_REPO_ID} on CUDA...")
     accelerator = Accelerator(mixed_precision="bf16")
-    dvlt_img_size = 504
+    dvlt_img_size = 518
     model = DVLT(img_size=dvlt_img_size)
     model.load_pretrained(DVLT_REPO_ID)
     model.setup_test(accelerator)
@@ -1009,10 +1043,12 @@ def cache_dvlt_predictions(splits: dict[str, Any], ks: tuple[int, ...] = (DVLT_D
             parsed = _parse_dvlt_out(out, N, (H, W))
             intr = parsed["intrinsics"] if parsed["intrinsics"] is not None else gt["gt_K"]
 
+            scale_msg = ""
             if k == DVLT_DEFAULT_K and "sim3_scale" not in gt:
                 s0, R0, t0_v = compute_fixed_sim3(parsed["depth"], parsed["poses"], intr, gt["gt_depth"], gt["gt_poses"], gt["gt_K"])
                 gt["sim3_scale"], gt["sim3_R"], gt["sim3_t"] = np.array(s0), R0, t0_v
                 np.savez_compressed(sdir / "gt.npz", **gt)
+                scale_msg = f" | sim3_scale={s0:.3f}"
 
             torch.save({
                 "rgb": torch.from_numpy(rgb).permute(0, 3, 1, 2).contiguous(),
@@ -1022,7 +1058,7 @@ def cache_dvlt_predictions(splits: dict[str, Any], ks: tuple[int, ...] = (DVLT_D
                 "intrinsics": torch.from_numpy(intr.astype(np.float32)),
                 "dvlt_k": k, "dvlt_runtime_sec": float(dt),
             }, cpath)
-            print(f"[Stage 2] {sid} K={k}: {dt:.2f}s")
+            print(f"[Stage 2] {sid} K={k}: {dt:.2f}s{scale_msg}")
 
     del model, accelerator
     gc.collect()
@@ -1368,6 +1404,7 @@ if __name__ == "__main__":
         compute_and_cache_baselines(json.loads(SPLITS_PATH.read_text()), ks=ks)
     else:
         splits = download_sage_scenes(args.num_dev, args.num_val, args.num_test, args.local_sage_dir)
+        export_sage_glbs(splits)
         render_sage_scenes(splits, cycles_samples=args.cycles_samples)
         cache_dvlt_predictions(splits, ks=ks)
         cache_predicted_semantics(splits)
