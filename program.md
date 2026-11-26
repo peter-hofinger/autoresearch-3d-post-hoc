@@ -1,114 +1,111 @@
-# autoresearch
+# autoresearch-3d-post-hoc
 
-This is an experiment to have the LLM do its own research.
+This is an autonomous research setup for **Semantic-Guided Refinement for Feed-Forward 3D Reconstruction** (Déjà View / DVLT on NVIDIA SAGE-10k, single RTX 3080).
+
+Core scientific question:
+> *Does semantic guidance (instance masks, object categories, dense semantic features, and 3D cross-view semantic association) measurably improve surface quality, geometric accuracy, and object boundary preservation beyond an equally-optimized non-semantic refinement baseline — and is the gain worth the extra compute?*
+
+---
 
 ## Setup
 
 To set up a new experiment, work with the user to:
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
-3. **Read the in-scope files**: The repo is small. Read these files for full context:
+1. **Agree on a run tag & track**: propose a tag based on today's date and track:
+   - **Track A (`autoresearch/<tag>-geom`)**: Non-semantic control (`MODE = "none"` in `train.py`). *Always run Track A first* to build a genuinely strong geometry/RGB-only baseline.
+   - **Track B (`autoresearch/<tag>-oracle`)**: Branch off the best Track A commit, set `MODE = "oracle"` (exact SAGE-10k masks & structural categories) to establish the theoretical semantic upper bound.
+   - **Track C (`autoresearch/<tag>-pred`)**: Branch off the best Track B (or Track A) commit, set `MODE = "predicted"` (SAM 2 + Mask2Former + DINOv2) to solve cross-view 3D semantic association and real-world semantic refinement.
+2. **Create the branch**: `git checkout -b autoresearch/<tag>-<track>`.
+3. **Read the in-scope files**: The repo is deliberately minimal. Read them in full:
    - `README.md` — repository context.
-   - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
-   - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
+   - `prepare.py` — frozen constants, data prep, mode isolation, TSDF surface extraction, and evaluation harness. **Do not modify.**
+   - `train.py` — the single file you modify. Refinement model, semantic lifting, losses, optimizer, and refinement loop.
+4. **Verify cached data exists**: Check `~/.cache/autoresearch-3d/` contains `splits.json`, scene caches (`gt.npz`, `dvlt_k8.pt`, `semantics_pred.pt`), and `baseline_dev_k8.json`. If not, tell the human to run `uv run prepare.py`.
+5. **Initialize `results.tsv`**: Create `results.tsv` (untracked by git) with the header row below.
+6. **Confirm and go**: Confirm setup with the user, then enter the autonomous loop.
 
-Once you get confirmation, kick off the experimentation.
+---
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+Each experiment runs on a single RTX 3080 GPU under a **fixed time budget of `TIME_BUDGET = 120` seconds** across the `dev` scenes (~15s/scene). Launch simply as:
+
+```bash
+uv run train.py > run.log 2>&1
+```
 
 **What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+- Modify `train.py` — this is the ONLY file you edit. Everything is fair game: parameterization (depth residuals, SE(3) pose refinement, implicit/surfel/bilateral/PDE solvers), cross-view 3D semantic lifting (`lift_semantics_3d`), losses (multi-view reprojection, 2nd-order curvature, anisotropic normal smoothing, flying-pixel cleanup, soft SVD/RANSAC planarity, Manhattan/gravity orthogonality, category-dependent detail protection, DINO feature consistency), optimizers (Adam, L-BFGS, IRLS, coarse-to-fine), and schedules.
 
 **What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
+- Modify `prepare.py`. It is strictly read-only.
+- Read `gt.npz`, ground-truth depths/normals/poses, or the locked `test` split from `train.py`.
+- Bypass mode isolation (`MODE = "none"` strips all semantic tensors to `None`).
+- Install new packages or modify `pyproject.toml`.
+- Cheat metrics by pruning uncertain regions (`coverage` must stay `>= 0.95` or `val_score` is heavily penalized).
 
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+**The goal: minimize `val_score` (raw Déjà View K=8 baseline = `1.000000`).**
+`prepare.py` aligns outputs with the frozen raw-DVLT Sim(3) transform, fuses a fixed `1.5 cm` Open3D TSDF surface mesh, and scores 4 orthogonal axes:
+- `cd_cm` (30%): Chamfer Distance (Accuracy + Completeness)
+- `1 - f1_2cm` (25%): F-score error @ 2 cm (prevents point deletion)
+- `nae_deg` (25%): Mean Normal Angular Error vs. exact GT normals (measures surface smoothness & noise reduction)
+- `edge_err_cm` (20%): Depth error strictly on GT object silhouettes & depth discontinuities (prevents oversmoothing & flying pixels)
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
+**VRAM & runtime**: Keep `peak_vram_mb < 9000` (RTX 3080 headroom) and `refine_seconds <= 125.0`. If a run exceeds 4 minutes total wall-clock, kill it and treat as a failure.
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
+**Simplicity criterion**: All else being equal, simpler and faster is better. A tiny `0.001` gain that adds 50 lines of fragile code or doubles runtime is not worth keeping. Equal or better `val_score` with simpler code is always a keep.
 
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
+**First run**: Always run `train.py` as-is first on each track to log the verified starting point.
 
-## Output format
-
-Once the script finishes it prints a summary like this:
-
-```
 ---
-val_bpb:          0.997900
-training_seconds: 300.1
-total_seconds:    325.9
-peak_vram_mb:     45060.2
-mfu_percent:      39.80
-total_tokens_M:   499.6
-num_steps:        953
-num_params_M:     50.3
-depth:            8
+
+## Output Format & Logging
+
+Extract metrics from `run.log`:
+
+```bash
+grep -E "^(val_score|cd_cm|f1_2cm|nae_deg|edge_err_cm|coverage|scene_seconds|peak_vram_mb):" run.log
 ```
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
+Log every run to `results.tsv` (tab-separated, 11 columns — leave untracked by git):
 
-```
-grep "^val_bpb:" run.log
-```
-
-## Logging results
-
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
-
-The TSV has a header row and 5 columns:
-
-```
-commit	val_bpb	memory_gb	status	description
+```text
+commit	track	val_score	cd_cm	f1_2cm	nae_deg	edge_err_cm	scene_sec	memory_gb	status	description
 ```
 
-1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
+- `commit`: 7-char short git hash
+- `track`: `none`, `oracle`, or `predicted`
+- `val_score`: 6 decimals (`0.000000` for crash)
+- `cd_cm`, `f1_2cm`, `nae_deg`, `edge_err_cm`, `scene_sec`, `memory_gb`: numeric metrics (`0.0` for crash; `memory_gb = peak_vram_mb / 1024`)
+- `status`: `keep`, `discard`, or `crash`
+- `description`: concise single-line summary (no tabs)
 
-Example:
+---
 
-```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
-```
+## Research Directions by Track
 
-## The experiment loop
+- **Track A (`MODE = "none"` — Strong Geometry/RGB Control)**:
+  Activate `NUM_STEPS`, tune LR/schedules/robust losses (Huber/Cauchy/Charbonnier), all-pairs/top-k multi-view depth & normal reprojection consistency, 2nd-order curvature + anisotropic normal smoothing, RGB-edge weights, anchored SE(3) pose refinement (`LR_POSE > 0`), photometric SSIM/L1 consistency, and flying-pixel filtering without dropping `coverage < 0.95`.
+- **Track B (`MODE = "oracle"` — Semantic Upper Bound)**:
+  Zero-bleed instance-boundary edge stopping, turning OFF RGB edge stopping inside `planar_stuff` (`struct_id == 1`) so textured walls/floors smooth cleanly, soft SVD/IRLS planarity + Manhattan/gravity orthogonality for `planar_stuff`, curvature/detail preservation for `rigid_thing` (`struct_id == 2`), anti-oversmoothing protection for `thin_or_nonrigid` (`struct_id == 3`), and boundary-pixel snapping toward interior instance depth to crush `edge_err_cm`.
+- **Track C (`MODE = "predicted"` — Real-World Semantics & Milestone 2 Lifting)**:
+  Upgrade `lift_semantics_3d()`: cross-view 3D semantic label voting (eliminating Mask2Former flicker), cross-view SAM 2 mask association via 3D reprojection overlap + DINOv2 cosine similarity, continuous DINO affinity edge weights (graceful fallback when SAM 2 errs), cross-view DINO feature reprojection loss, `class_conf`-gated fallback to Track A geometry priors, and pruning cues that do not justify their extraction compute.
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
+---
+
+## The Experiment Loop
 
 LOOP FOREVER:
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
+1. Inspect git state and `results.tsv`; pick the highest-leverage hypothesis based on which sub-metric (`cd_cm`, `f1_2cm`, `nae_deg`, `edge_err_cm`) has the largest gap.
+2. Edit `train.py`.
+3. `git add train.py && git commit -m "<short description>"`
+4. Run: `uv run train.py > run.log 2>&1`
+5. Read metrics: `grep -E "^(val_score|cd_cm|f1_2cm|nae_deg|edge_err_cm|coverage|scene_seconds|peak_vram_mb):" run.log`
+6. If empty or crashed, inspect `tail -n 50 run.log`. Fix trivial bugs immediately; if fundamentally broken, log `crash` in `results.tsv` and `git reset --hard HEAD~1`.
+7. Append the row to `results.tsv` (never commit `results.tsv`).
+8. If `val_score` improved AND `coverage >= 0.95` AND `refine_seconds <= 125.0` AND complexity is justified → **keep** (advance branch). On breakthroughs (`>= 0.015` improvement), optionally save visual audits via `uv run train.py --visual-audit visuals/<track> > /dev/null 2>&1`.
+9. Otherwise → **discard** (`git reset --hard HEAD~1`).
+10. Every ~15 keeps (or before switching tracks), run a single check on `--split val` (NEVER `--split test`) to verify generalization.
 
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
-
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
-
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
-
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
-
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+**NEVER STOP**: Once the experiment loop has begun (after setup confirmation), do NOT pause to ask the human whether to continue. Keep iterating autonomously until manually stopped.

@@ -7,17 +7,28 @@ wheels/
 *.egg-info
 
 # Virtual environments
-.venv
+.venv/
 worktrees/
+
+# Experiment logs & outputs
+results.tsv
+run.log
 results/
+visuals/
+preds/
 queue/
+
+# Local caches & temporary downloads
+cache/
+data/
+*.ply
+*.glb
+*.pt
+*.npz
 
 # Agent prompt files (generated per-session by launchers)
 CLAUDE.md
 AGENTS.md
 
-# Experimental code/artifacts
+# Scratch / experimental code
 dev/
-
-# Results file
-results.tsv

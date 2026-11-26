@@ -1,630 +1,464 @@
 """
-Autoresearch pretraining script. Single-GPU, single-file.
-Cherry-picked and simplified from nanochat.
-Usage: uv run train.py
+Autoresearch post-hoc 3D refinement script. Single-GPU, single-file.
+THIS IS THE ONLY FILE THE AGENT EDITS during autonomous experimentation.
+
+Usage:
+    uv run train.py                         # Uses MODE / SPLIT / DVLT_K below
+    uv run train.py --mode none             # Track A: non-semantic control
+    uv run train.py --mode oracle           # Track B: oracle SAGE-10k semantics (upper bound)
+    uv run train.py --mode predicted        # Track C: SAM 2 + Mask2Former + DINOv2
 """
 
-import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+from __future__ import annotations
 
-import gc
+import argparse
 import math
 import time
-from dataclasses import dataclass, asdict
+from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
-
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
-
-# ---------------------------------------------------------------------------
-# GPT Model
-# ---------------------------------------------------------------------------
-
-@dataclass
-class GPTConfig:
-    sequence_len: int = 2048
-    vocab_size: int = 32768
-    n_layer: int = 12
-    n_head: int = 6
-    n_kv_head: int = 6
-    n_embd: int = 768
-    window_pattern: str = "SSSL"
-
-
-def norm(x):
-    return F.rms_norm(x, (x.size(-1),))
-
-
-def has_ve(layer_idx, n_layer):
-    """Returns True if layer should have Value Embedding (alternating, last always included)."""
-    return layer_idx % 2 == (n_layer - 1) % 2
-
-
-def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:]
-    y1 = x1 * cos + x2 * sin
-    y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3)
-
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
-        super().__init__()
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        assert self.n_embd % self.n_head == 0
-        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
-
-    def forward(self, x, ve, cos_sin, window_size):
-        B, T, C = x.size()
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-
-        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
-        if ve is not None:
-            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
-            v = v + gate.unsqueeze(-1) * ve
-
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k)
-
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        y = y.contiguous().view(B, T, -1)
-        y = self.c_proj(y)
-        return y
-
-
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
-        x = self.c_proj(x)
-        return x
-
-
-class Block(nn.Module):
-    def __init__(self, config, layer_idx):
-        super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
-
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
-        return x
-
-
-class GPT(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.window_sizes = self._compute_window_sizes(config)
-        self.transformer = nn.ModuleDict({
-            "wte": nn.Embedding(config.vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
-        })
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
-        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
-        # Value embeddings
-        head_dim = config.n_embd // config.n_head
-        kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({
-            str(i): nn.Embedding(config.vocab_size, kv_dim)
-            for i in range(config.n_layer) if has_ve(i, config.n_layer)
-        })
-        # Rotary embeddings
-        self.rotary_seq_len = config.sequence_len * 10
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
-
-    @torch.no_grad()
-    def init_weights(self):
-        # Embedding and unembedding
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
-        # Transformer blocks
-        n_embd = self.config.n_embd
-        s = 3**0.5 * n_embd**-0.5
-        for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
-        # Per-layer scalars
-        self.resid_lambdas.fill_(1.0)
-        self.x0_lambdas.fill_(0.1)
-        # Value embeddings
-        for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
-        # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
-        for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
-                torch.nn.init.zeros_(block.attn.ve_gate.weight)
-        # Rotary embeddings
-        head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        self.cos, self.sin = cos, sin
-        # Cast embeddings to bf16
-        self.transformer.wte.to(dtype=torch.bfloat16)
-        for ve in self.value_embeds.values():
-            ve.to(dtype=torch.bfloat16)
-
-    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
-        if device is None:
-            device = self.transformer.wte.weight.device
-        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
-        inv_freq = 1.0 / (base ** (channel_range / head_dim))
-        t = torch.arange(seq_len, dtype=torch.float32, device=device)
-        freqs = torch.outer(t, inv_freq)
-        cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16()
-        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
-        return cos, sin
-
-    def _compute_window_sizes(self, config):
-        pattern = config.window_pattern.upper()
-        assert all(c in "SL" for c in pattern)
-        long_window = config.sequence_len
-        short_window = long_window // 2
-        char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
-        window_sizes = []
-        for layer_idx in range(config.n_layer):
-            char = pattern[layer_idx % len(pattern)]
-            window_sizes.append(char_to_window[char])
-        window_sizes[-1] = (long_window, 0)
-        return window_sizes
-
-    def estimate_flops(self):
-        """Estimated FLOPs per token (forward + backward)."""
-        nparams = sum(p.numel() for p in self.parameters())
-        value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
-        h = self.config.n_head
-        q = self.config.n_embd // self.config.n_head
-        t = self.config.sequence_len
-        attn_flops = 0
-        for window_size in self.window_sizes:
-            window = window_size[0]
-            effective_seq = t if window < 0 else min(window, t)
-            attn_flops += 12 * h * q * effective_seq
-        return 6 * (nparams - nparams_exclude) + attn_flops
-
-    def num_scaling_params(self):
-        wte = sum(p.numel() for p in self.transformer.wte.parameters())
-        value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
-        lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
-        return {
-            'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
-            'transformer_matrices': transformer_matrices, 'scalars': scalars, 'total': total,
-        }
-
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
-                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
-        model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
-        value_embeds_params = list(self.value_embeds.parameters())
-        embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
-        # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
-        dmodel_lr_scale = (model_dim / 768) ** -0.5
-        print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
-        param_groups = [
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
-        ]
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
-            ))
-        optimizer = MuonAdamW(param_groups)
-        for group in optimizer.param_groups:
-            group["initial_lr"] = group["lr"]
-        return optimizer
-
-    def forward(self, idx, targets=None, reduction='mean'):
-        B, T = idx.size()
-        assert T <= self.cos.size(1)
-        cos_sin = self.cos[:, :T], self.sin[:, :T]
-
-        x = self.transformer.wte(idx)
-        x = norm(x)
-        x0 = x
-        for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
-        x = norm(x)
-
-        softcap = 15
-        logits = self.lm_head(x)
-        logits = logits.float()
-        logits = softcap * torch.tanh(logits / softcap)
-
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
-                                   ignore_index=-1, reduction=reduction)
-            return loss
-        return logits
-
-# ---------------------------------------------------------------------------
-# Optimizer (MuonAdamW, single GPU only)
-# ---------------------------------------------------------------------------
-
-polar_express_coeffs = [
-    (8.156554524902461, -22.48329292557795, 15.878769915207462),
-    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
-    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
-    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
-    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
-]
-
-@torch.compile(dynamic=False, fullgraph=True)
-def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
-    p.mul_(1 - lr_t * wd_t)
-    exp_avg.lerp_(grad, 1 - beta1_t)
-    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
-    bias1 = 1 - beta1_t ** step_t
-    bias2 = 1 - beta2_t ** step_t
-    denom = (exp_avg_sq / bias2).sqrt() + eps_t
-    step_size = lr_t / bias1
-    p.add_(exp_avg / denom, alpha=-step_size)
-
-@torch.compile(dynamic=False, fullgraph=True)
-def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
-                    momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
-    # Nesterov momentum
-    momentum = momentum_t.to(stacked_grads.dtype)
-    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
-    g = stacked_grads.lerp_(momentum_buffer, momentum)
-    # Polar express orthogonalization
-    X = g.bfloat16()
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
-    if g.size(-2) > g.size(-1):
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X.mT @ X
-            B = b * A + c * (A @ A)
-            X = a * X + X @ B
-    else:
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X @ X.mT
-            B = b * A + c * (A @ A)
-            X = a * X + B @ X
-    g = X
-    # NorMuon variance reduction
-    beta2 = beta2_t.to(g.dtype)
-    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
-    red_dim_size = g.size(red_dim)
-    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
-    v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
-    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
-    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
-    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
-    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
-    g = g * final_scale.to(g.dtype)
-    # Cautious weight decay + parameter update
-    lr = lr_t.to(g.dtype)
-    wd = wd_t.to(g.dtype)
-    mask = (g * stacked_params) >= 0
-    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
-
-
-class MuonAdamW(torch.optim.Optimizer):
-    """Combined optimizer: Muon for 2D matrix params, AdamW for others."""
-
-    def __init__(self, param_groups):
-        super().__init__(param_groups, defaults={})
-        # 0-D CPU tensors to avoid torch.compile recompilation when values change
-        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-
-    def _step_adamw(self, group):
-        for p in group['params']:
-            if p.grad is None:
-                continue
-            grad = p.grad
-            state = self.state[p]
-            if not state:
-                state['step'] = 0
-                state['exp_avg'] = torch.zeros_like(p)
-                state['exp_avg_sq'] = torch.zeros_like(p)
-            state['step'] += 1
-            self._adamw_step_t.fill_(state['step'])
-            self._adamw_lr_t.fill_(group['lr'])
-            self._adamw_beta1_t.fill_(group['betas'][0])
-            self._adamw_beta2_t.fill_(group['betas'][1])
-            self._adamw_eps_t.fill_(group['eps'])
-            self._adamw_wd_t.fill_(group['weight_decay'])
-            adamw_step_fused(p, grad, state['exp_avg'], state['exp_avg_sq'],
-                            self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                            self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
-
-    def _step_muon(self, group):
-        params = group['params']
-        if not params:
-            return
-        p = params[0]
-        state = self.state[p]
-        num_params = len(params)
-        shape, device, dtype = p.shape, p.device, p.dtype
-        if "momentum_buffer" not in state:
-            state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
-        if "second_momentum_buffer" not in state:
-            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
-        red_dim = -1 if shape[-2] >= shape[-1] else -2
-        stacked_grads = torch.stack([p.grad for p in params])
-        stacked_params = torch.stack(params)
-        self._muon_momentum_t.fill_(group["momentum"])
-        self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
-        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
-        self._muon_wd_t.fill_(group["weight_decay"])
-        muon_step_fused(stacked_grads, stacked_params,
-                        state["momentum_buffer"], state["second_momentum_buffer"],
-                        self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
-                        self._muon_beta2_t, group["ns_steps"], red_dim)
-        torch._foreach_copy_(params, list(stacked_params.unbind(0)))
-
-    @torch.no_grad()
-    def step(self):
-        for group in self.param_groups:
-            if group['kind'] == 'adamw':
-                self._step_adamw(group)
-            elif group['kind'] == 'muon':
-                self._step_muon(group)
-
-# ---------------------------------------------------------------------------
-# Hyperparameters (edit these directly, no CLI flags needed)
-# ---------------------------------------------------------------------------
-
-# Model architecture
-ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
-
-# Optimization
-TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
-EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
-UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
-SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
-ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
-
-# Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
-
-# ---------------------------------------------------------------------------
-# Setup: tokenizer, model, optimizer, dataloader
-# ---------------------------------------------------------------------------
-
-t_start = time.time()
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
-
-tokenizer = Tokenizer.from_directory()
-vocab_size = tokenizer.get_vocab_size()
-print(f"Vocab size: {vocab_size:,}")
-
-def build_model_config(depth):
-    base_dim = depth * ASPECT_RATIO
-    model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
-    num_heads = model_dim // HEAD_DIM
-    return GPTConfig(
-        sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=WINDOW_PATTERN,
-    )
-
-config = build_model_config(DEPTH)
-print(f"Model config: {asdict(config)}")
-
-with torch.device("meta"):
-    model = GPT(config)
-model.to_empty(device=device)
-model.init_weights()
-
-param_counts = model.num_scaling_params()
-print("Parameter counts:")
-for key, value in param_counts.items():
-    print(f"  {key:24s}: {value:,}")
-num_params = param_counts['total']
-num_flops_per_token = model.estimate_flops()
-print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
-
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
-assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
-
-optimizer = model.setup_optimizer(
-    unembedding_lr=UNEMBEDDING_LR,
-    embedding_lr=EMBEDDING_LR,
-    scalar_lr=SCALAR_LR,
-    adam_betas=ADAM_BETAS,
-    matrix_lr=MATRIX_LR,
-    weight_decay=WEIGHT_DECAY,
+from prepare import (
+    DVLT_DEFAULT_K,
+    TIME_BUDGET,
+    evaluate_reconstruction,
+    get_split_scenes,
+    load_scene,
+    save_visual_audit,
 )
 
-model = torch.compile(model, dynamic=False)
-
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
-x, y, epoch = next(train_loader)  # prefetch first batch
-
-print(f"Time budget: {TIME_BUDGET}s")
-print(f"Gradient accumulation steps: {grad_accum_steps}")
-
-# Schedules (all based on progress = training_time / TIME_BUDGET)
-
-def get_lr_multiplier(progress):
-    if progress < WARMUP_RATIO:
-        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
-    elif progress < 1.0 - WARMDOWN_RATIO:
-        return 1.0
-    else:
-        cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
-
-def get_muon_momentum(step):
-    frac = min(step / 300, 1)
-    return (1 - frac) * 0.85 + frac * 0.95
-
-def get_weight_decay(progress):
-    return WEIGHT_DECAY * (1 - progress)
-
 # ---------------------------------------------------------------------------
-# Training loop
+# Hyperparameters (edit directly — no CLI flags needed for experiments)
 # ---------------------------------------------------------------------------
 
-t_start_training = time.time()
-smooth_train_loss = 0
-total_training_time = 0
-step = 0
+# Experiment track (set per branch: "none" -> "oracle" -> "predicted")
+MODE = "none"
+SPLIT = "dev"
+DVLT_K = DVLT_DEFAULT_K
 
-while True:
-    torch.cuda.synchronize()
+# Optimization schedule (NUM_STEPS = 0 is the exact raw Déjà View baseline)
+NUM_STEPS = 0
+LR_DEPTH = 0.015
+LR_POSE = 0.0                  # Set > 0 (e.g. 5e-4) to enable joint SE(3) pose refinement
+WARMUP_FRAC = 0.05
+FINAL_LR_FRAC = 0.10
+
+# Geometry & photometric loss weights (Track A: active in all modes)
+W_DATA = 1.0                   # Confidence-weighted fidelity to raw Déjà View depth
+W_MULTIVIEW = 0.5              # Cross-view depth & normal reprojection consistency
+W_CURVATURE = 0.15             # 2nd-order depth curvature smoothness (preserves tilted planes)
+W_NORMAL_SMOOTH = 0.15         # Edge-aware surface normal smoothness
+RGB_EDGE_SIGMA = 0.08          # RGB gradient edge-stopping scale
+HUBER_DELTA = 0.05             # Robust Huber transition (raw depth units)
+
+# Semantic-guided weights (Track B & C: automatically inactive when MODE == "none")
+W_SEM_BOUNDARY = 1.0           # Suppress smoothing across semantic / instance boundaries
+W_PLANAR = 0.0                 # Soft per-instance planarity prior for struct_id == 1 (planar_stuff)
+W_RIGID_DETAIL = 0.0           # Extra detail fidelity for struct_id == 2 (rigid_thing)
+W_THIN_PROTECT = 0.0           # Anti-oversmoothing protection for struct_id == 3 (thin_nonrigid)
+W_DINO_CONSISTENCY = 0.0       # Cross-view DINOv2 feature reprojection consistency
+
+
+# ---------------------------------------------------------------------------
+# Differentiable 3D Geometry & SE(3) Primitives
+# ---------------------------------------------------------------------------
+
+def so3_exp_map(omega: torch.Tensor) -> torch.Tensor:
+    """Rodrigues exponential map from axis-angle (M, 3) -> rotation matrices (M, 3, 3)."""
+    theta = omega.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    k = omega / theta
+    kx, ky, kz = k.unbind(dim=-1)
+    zeros = torch.zeros_like(kx)
+    K = torch.stack([
+        torch.stack([zeros, -kz, ky], dim=-1),
+        torch.stack([kz, zeros, -kx], dim=-1),
+        torch.stack([-ky, kx, zeros], dim=-1),
+    ], dim=-2)
+    eye = torch.eye(3, device=omega.device, dtype=omega.dtype).expand_as(K)
+    sin_t = torch.sin(theta).unsqueeze(-1)
+    cos_t = torch.cos(theta).unsqueeze(-1)
+    return eye + sin_t * K + (1.0 - cos_t) * (K @ K)
+
+
+def unproject_depth(depth: torch.Tensor, K: torch.Tensor, poses_c2w: torch.Tensor | None = None) -> torch.Tensor:
+    """Back-project depth (N, H, W) into camera-space or world-space 3D points (N, H, W, 3)."""
+    N, H, W = depth.shape
+    v, u = torch.meshgrid(
+        torch.arange(H, device=depth.device, dtype=depth.dtype),
+        torch.arange(W, device=depth.device, dtype=depth.dtype),
+        indexing="ij",
+    )
+    fx = K[:, 0, 0].view(N, 1, 1).clamp_min(1e-6)
+    fy = K[:, 1, 1].view(N, 1, 1).clamp_min(1e-6)
+    cx = K[:, 0, 2].view(N, 1, 1)
+    cy = K[:, 1, 2].view(N, 1, 1)
+    pts_c = torch.stack([(u.unsqueeze(0) - cx) * depth / fx, (v.unsqueeze(0) - cy) * depth / fy, depth], dim=-1)
+    if poses_c2w is None:
+        return pts_c
+    return torch.einsum("nij,nhwj->nhwi", poses_c2w[:, :3, :3], pts_c) + poses_c2w[:, None, None, :3, 3]
+
+
+def compute_depth_normals(depth: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
+    """Differentiable camera-space unit surface normals (N, H, W, 3) oriented toward camera (-Z)."""
+    pts = unproject_depth(depth, K, poses_c2w=None)
+    dx = F.pad((pts[:, :, 2:, :] - pts[:, :, :-2, :]).permute(0, 3, 1, 2), (1, 1, 0, 0), mode="replicate").permute(0, 2, 3, 1)
+    dy = F.pad((pts[:, 2:, :, :] - pts[:, :-2, :, :]).permute(0, 3, 1, 2), (0, 0, 1, 1), mode="replicate").permute(0, 2, 3, 1)
+    n = F.normalize(torch.cross(dy, dx, dim=-1), dim=-1, eps=1e-6)
+    return n * torch.where(n[..., 2:3] > 0, -1.0, 1.0)
+
+
+def rgb_edge_weights(rgb: torch.Tensor, sigma: float = RGB_EDGE_SIGMA) -> tuple[torch.Tensor, torch.Tensor]:
+    """Anisotropic horizontal (N, H, W-1) and vertical (N, H-1, W) edge-stopping weights from RGB."""
+    gx = (rgb[:, :, :, 1:] - rgb[:, :, :, :-1]).abs().mean(dim=1)
+    gy = (rgb[:, :, 1:, :] - rgb[:, :, :-1, :]).abs().mean(dim=1)
+    return torch.exp(-gx / max(sigma, 1e-4)), torch.exp(-gy / max(sigma, 1e-4))
+
+
+def semantic_edge_weights(
+    instance_id: torch.Tensor | None,
+    boundary_prob: torch.Tensor | None,
+    rgb_wx: torch.Tensor,
+    rgb_wy: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Modulate edge-stopping weights with instance masks & soft boundaries when available."""
+    if instance_id is None and boundary_prob is None:
+        return rgb_wx, rgb_wy
+    wx, wy = rgb_wx, rgb_wy
+    if instance_id is not None:
+        wx = (instance_id[:, :, 1:] == instance_id[:, :, :-1]).float()
+        wy = (instance_id[:, 1:, :] == instance_id[:, :-1, :]).float()
+    if boundary_prob is not None:
+        wx = wx * (1.0 - torch.maximum(boundary_prob[:, :, 1:], boundary_prob[:, :, :-1]).clamp(0.0, 1.0))
+        wy = wy * (1.0 - torch.maximum(boundary_prob[:, 1:, :], boundary_prob[:, :-1, :]).clamp(0.0, 1.0))
+    return wx, wy
+
+
+# ---------------------------------------------------------------------------
+# Differentiable Refinement Losses
+# ---------------------------------------------------------------------------
+
+def multiview_reprojection_loss(
+    depth: torch.Tensor,
+    poses_c2w: torch.Tensor,
+    K: torch.Tensor,
+    conf: torch.Tensor,
+    offsets: tuple[int, ...] = (1, -1),
+    delta: float = HUBER_DELTA,
+) -> torch.Tensor:
+    """Vectorized cross-view depth reprojection consistency with soft occlusion gating."""
+    N, H, W = depth.shape
+    pts_w = unproject_depth(depth, K, poses_c2w)
+    w2c = torch.linalg.inv(poses_c2w)
+
+    total = depth.new_tensor(0.0)
+    used = 0
+    for off in offsets:
+        j = (torch.arange(N, device=depth.device) + off) % N
+        pts_j = torch.einsum("nij,nhwj->nhwi", w2c[j, :3, :3], pts_w) + w2c[j, None, None, :3, 3]
+        z_p = pts_j[..., 2].clamp_min(1e-4)
+        K_j = K[j]
+        u_j = pts_j[..., 0] * K_j[:, 0, 0].view(N, 1, 1) / z_p + K_j[:, 0, 2].view(N, 1, 1)
+        v_j = pts_j[..., 1] * K_j[:, 1, 1].view(N, 1, 1) / z_p + K_j[:, 1, 2].view(N, 1, 1)
+
+        gx = 2.0 * (u_j / max(W - 1, 1)) - 1.0
+        gy = 2.0 * (v_j / max(H - 1, 1)) - 1.0
+        grid = torch.stack([gx, gy], dim=-1)
+        in_fov = (pts_j[..., 2] > 0.05) & (gx >= -1.0) & (gx <= 1.0) & (gy >= -1.0) & (gy <= 1.0)
+
+        z_s = F.grid_sample(depth[j].unsqueeze(1), grid, mode="bilinear", padding_mode="border", align_corners=True).squeeze(1)
+        occ_ok = in_fov & ((z_p - z_s).abs() / z_p.detach().clamp_min(0.1) < 0.20)
+        if occ_ok.any():
+            w = conf * occ_ok.float()
+            loss_ij = F.huber_loss(z_p, z_s.detach(), reduction="none", delta=delta)
+            total = total + (loss_ij * w).sum() / w.sum().clamp_min(1.0)
+            used += 1
+    return total / max(used, 1)
+
+
+def curvature_smoothness_loss(depth: torch.Tensor, wx: torch.Tensor, wy: torch.Tensor) -> torch.Tensor:
+    """2nd-order (Laplacian) depth smoothness — preserves slanted planes without 1st-order TV staircasing."""
+    d2x = (depth[:, :, 2:] - 2.0 * depth[:, :, 1:-1] + depth[:, :, :-2]).abs()
+    d2y = (depth[:, 2:, :] - 2.0 * depth[:, 1:-1, :] + depth[:, :-2, :]).abs()
+    wx2 = torch.minimum(wx[:, :, 1:], wx[:, :, :-1])
+    wy2 = torch.minimum(wy[:, 1:, :], wy[:, :-1, :])
+    return (wx2 * d2x).mean() + (wy2 * d2y).mean()
+
+
+def planar_prior_loss(
+    pts_w: torch.Tensor,
+    struct_id: torch.Tensor | None,
+    instance_id: torch.Tensor | None,
+    conf: torch.Tensor,
+    min_pixels: int = 256,
+) -> torch.Tensor:
+    """
+    Soft per-instance planarity prior for planar_stuff (struct_id == 1) instances:
+    penalizes the smallest eigenvalue of each planar region's 3D point covariance.
+    """
+    if struct_id is None or instance_id is None:
+        return pts_w.new_tensor(0.0)
+
+    planar_mask = struct_id == 1
+    if not planar_mask.any():
+        return pts_w.new_tensor(0.0)
+
+    # Fit soft planes per (view, instance) on planar pixels
+    N = pts_w.shape[0]
+    losses = []
+    for vi in range(N):
+        pm = planar_mask[vi]
+        if pm.sum() < min_pixels:
+            continue
+        inst_v = instance_id[vi][pm]
+        pts_v = pts_w[vi][pm]
+        w_v = conf[vi][pm].clamp(0.05, 1.0)
+        for uid in torch.unique(inst_v):
+            if uid <= 0:
+                continue
+            m = inst_v == uid
+            if m.sum() < min_pixels:
+                continue
+            p = pts_v[m]
+            w = w_v[m]
+            w = w / w.sum().clamp_min(1e-6)
+            mu = (p * w[:, None]).sum(dim=0, keepdim=True)
+            pc = p - mu
+            cov = (pc * w[:, None]).T @ pc
+            eigvals = torch.linalg.eigvalsh(cov)  # ascending: smallest eigenvalue = plane thickness^2
+            losses.append(eigvals[0].clamp_min(0.0).sqrt())
+
+    if not losses:
+        return pts_w.new_tensor(0.0)
+    return torch.stack(losses).mean()
+
+
+# ---------------------------------------------------------------------------
+# Refinement Model & Milestone 2 Cross-View Semantic Lifting
+# ---------------------------------------------------------------------------
+
+class RefinementModel(nn.Module):
+    """Differentiable per-scene post-hoc refinement parameterization (depth + anchored SE(3) poses)."""
+
+    def __init__(self, init_depth: torch.Tensor, init_poses: torch.Tensor, refine_poses: bool = False):
+        super().__init__()
+        self.register_buffer("log_d0", init_depth.clamp_min(1e-3).log())
+        self.register_buffer("init_poses", init_poses)
+        self.delta_log_depth = nn.Parameter(torch.zeros_like(init_depth))
+        self.refine_poses = refine_poses
+        N = init_poses.shape[0]
+        # Anchor view 0 to identity so the global coordinate frame stays aligned to frozen Sim(3)
+        self.delta_rot = nn.Parameter(torch.zeros(max(N - 1, 1), 3, device=init_poses.device), requires_grad=refine_poses)
+        self.delta_trans = nn.Parameter(torch.zeros(max(N - 1, 1), 3, device=init_poses.device), requires_grad=refine_poses)
+
+    def forward(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        depth = (self.log_d0 + self.delta_log_depth).exp()
+        if not self.refine_poses or self.init_poses.shape[0] <= 1:
+            poses = self.init_poses
+        else:
+            dR = so3_exp_map(self.delta_rot)
+            p_list = [self.init_poses[0:1]]
+            R_upd = dR @ self.init_poses[1:, :3, :3]
+            t_upd = self.init_poses[1:, :3, 3] + self.delta_trans
+            p_rest = self.init_poses[1:].clone()
+            p_rest[:, :3, :3] = R_upd
+            p_rest[:, :3, 3] = t_upd
+            p_list.append(p_rest)
+            poses = torch.cat(p_list, dim=0)
+        valid_mask = torch.ones_like(depth, dtype=torch.bool)
+        return depth, poses, valid_mask
+
+
+def lift_semantics_3d(scene: dict[str, Any]) -> dict[str, Any]:
+    """
+    Milestone 2 hook: associate noisy 2D semantic cues (SAM 2 masks, Mask2Former labels,
+    DINOv2 features) across views into 3D-consistent representations.
+    Replace/extend this function during Track C!
+    """
+    return {
+        "instance_id": scene["instance_id"],
+        "struct_id": scene["struct_id"],
+        "boundary_prob": scene["boundary_prob"],
+        "class_conf": scene["class_conf"],
+        "dino_feats": scene["dino_feats"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Optimization Loop (Fixed Per-Scene Time Budget)
+# ---------------------------------------------------------------------------
+
+def get_lr_mult(progress: float) -> float:
+    if WARMUP_FRAC > 0 and progress < WARMUP_FRAC:
+        return progress / WARMUP_FRAC
+    decay_prog = (progress - WARMUP_FRAC) / max(1.0 - WARMUP_FRAC, 1e-6)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * min(max(decay_prog, 0.0), 1.0)))
+    return FINAL_LR_FRAC + (1.0 - FINAL_LR_FRAC) * cosine
+
+
+def refine_scene(scene: dict[str, Any], time_budget_sec: float) -> dict[str, torch.Tensor]:
+    """Optimize RefinementModel for a single scene within time_budget_sec."""
+    init_depth = scene["depth"]
+    init_poses = scene["poses"]
+    init_conf = scene["conf"].clamp(0.05, 1.0)
+    rgb = scene["rgb"]
+    K = scene["intrinsics"]
+
+    if NUM_STEPS <= 0:
+        return {
+            "depth": init_depth.detach(),
+            "poses": init_poses.detach(),
+            "valid_mask": torch.ones_like(init_depth, dtype=torch.bool),
+        }
+
     t0 = time.time()
-    for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            loss = model(x, y)
-        train_loss = loss.detach()
-        loss = loss / grad_accum_steps
+    sem = lift_semantics_3d(scene)
+
+    rgb_wx, rgb_wy = rgb_edge_weights(rgb, sigma=RGB_EDGE_SIGMA)
+    if scene["mode"] != "none" and W_SEM_BOUNDARY > 0:
+        wx, wy = semantic_edge_weights(sem["instance_id"], sem["boundary_prob"], rgb_wx, rgb_wy)
+    else:
+        wx, wy = rgb_wx, rgb_wy
+
+    model = RefinementModel(init_depth, init_poses, refine_poses=(LR_POSE > 0))
+    param_groups = [{"params": [model.delta_log_depth], "lr": LR_DEPTH, "initial_lr": LR_DEPTH}]
+    if LR_POSE > 0:
+        param_groups.append({"params": [model.delta_rot, model.delta_trans], "lr": LR_POSE, "initial_lr": LR_POSE})
+    optimizer = torch.optim.Adam(param_groups)
+
+    for step in range(NUM_STEPS):
+        elapsed = time.time() - t0
+        if elapsed >= time_budget_sec * 0.92:
+            break
+
+        lrm = get_lr_mult(step / max(NUM_STEPS - 1, 1))
+        for g in optimizer.param_groups:
+            g["lr"] = g["initial_lr"] * lrm
+
+        optimizer.zero_grad(set_to_none=True)
+        depth, poses, _ = model()
+
+        # 1. Confidence-weighted data fidelity to Déjà View
+        loss_data = (F.huber_loss(depth, init_depth, reduction="none", delta=HUBER_DELTA) * init_conf).mean()
+
+        # 2. Multi-view geometric reprojection consistency
+        loss_mv = multiview_reprojection_loss(depth, poses, K, init_conf) if W_MULTIVIEW > 0 else depth.new_tensor(0.0)
+
+        # 3. 2nd-order edge-aware curvature smoothness
+        loss_curv = curvature_smoothness_loss(depth, wx, wy) if W_CURVATURE > 0 else depth.new_tensor(0.0)
+
+        # 4. Edge-aware surface normal smoothness
+        if W_NORMAL_SMOOTH > 0:
+            nrm = compute_depth_normals(depth, K)
+            dn_x = (1.0 - (nrm[:, :, 1:, :] * nrm[:, :, :-1, :]).sum(dim=-1)).clamp_min(0.0)
+            dn_y = (1.0 - (nrm[:, 1:, :, :] * nrm[:, :-1, :, :]).sum(dim=-1)).clamp_min(0.0)
+            loss_nrm = (wx * dn_x).mean() + (wy * dn_y).mean()
+        else:
+            loss_nrm = depth.new_tensor(0.0)
+
+        # 5. Optional semantic planar prior (Track B & C)
+        if scene["mode"] != "none" and W_PLANAR > 0:
+            pts_w = unproject_depth(depth, K, poses)
+            loss_planar = planar_prior_loss(pts_w, sem["struct_id"], sem["instance_id"], init_conf)
+        else:
+            loss_planar = depth.new_tensor(0.0)
+
+        loss = (
+            W_DATA * loss_data
+            + W_MULTIVIEW * loss_mv
+            + W_CURVATURE * loss_curv
+            + W_NORMAL_SMOOTH * loss_nrm
+            + W_PLANAR * loss_planar
+        )
+
+        if not torch.isfinite(loss):
+            print(f"FAIL: non-finite loss at step {step} on {scene['scene_id']}")
+            raise SystemExit(1)
+
         loss.backward()
-        x, y, epoch = next(train_loader)
+        optimizer.step()
 
-    # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
-    lrm = get_lr_multiplier(progress)
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(progress)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
-    optimizer.step()
-    model.zero_grad(set_to_none=True)
+    with torch.no_grad():
+        depth_out, poses_out, mask_out = model()
+    return {"depth": depth_out.detach(), "poses": poses_out.detach(), "valid_mask": mask_out.detach()}
 
-    train_loss_f = train_loss.item()
 
-    # Fast fail: abort if loss is exploding or NaN
-    if math.isnan(train_loss_f) or train_loss_f > 100:
-        print("FAIL")
-        exit(1)
+# ---------------------------------------------------------------------------
+# Benchmark Entry Point & Standardized Summary Output
+# ---------------------------------------------------------------------------
 
-    torch.cuda.synchronize()
-    t1 = time.time()
-    dt = t1 - t0
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Autoresearch 3D post-hoc refinement run")
+    parser.add_argument("--mode", type=str, default=MODE, choices=("none", "oracle", "predicted"))
+    parser.add_argument("--split", type=str, default=SPLIT, choices=("dev", "val", "test"))
+    parser.add_argument("--k", type=int, default=DVLT_K)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--visual-audit", type=str, default=None, help="Optional dir to save visual audit PNGs")
+    parser.add_argument("--allow-test", action="store_true", help="Unlock blind test split (ONLY for final eval)")
+    args = parser.parse_args()
 
-    if step > 10:
-        total_training_time += dt
+    t_start = time.time()
+    torch.manual_seed(42)
+    use_cuda = args.device == "cuda" and torch.cuda.is_available()
+    dev_str = "cuda" if use_cuda else "cpu"
+    if use_cuda:
+        torch.cuda.manual_seed(42)
+        torch.cuda.reset_peak_memory_stats()
+        torch.set_float32_matmul_precision("high")
 
-    # Logging
-    ema_beta = 0.9
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
-    pct_done = 100 * progress
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
+    scene_ids = get_split_scenes(args.split, allow_test=args.allow_test)
+    per_scene_budget = TIME_BUDGET / max(len(scene_ids), 1)
+    predictions: dict[str, dict[str, Any]] = {}
+    refine_times, sem_times = [], []
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    for sid in scene_ids:
+        scene = load_scene(sid, mode=args.mode, dvlt_k=args.k, device=dev_str)
+        sem_times.append(scene["sem_extract_sec"])
+        if use_cuda:
+            torch.cuda.synchronize()
+        t0 = time.time()
+        out = refine_scene(scene, time_budget_sec=per_scene_budget)
+        if use_cuda:
+            torch.cuda.synchronize()
+        dt = time.time() - t0
+        refine_times.append(dt)
+        predictions[sid] = {
+            "depth": out["depth"].detach().cpu().numpy().astype(np.float32),
+            "poses": out["poses"].detach().cpu().numpy().astype(np.float32),
+            "valid_mask": out["valid_mask"].detach().cpu().numpy().astype(bool) if out.get("valid_mask") is not None else None,
+        }
+        print(f"scene {sid} | refine: {dt:.2f}s | sem_extract: {scene['sem_extract_sec']:.2f}s")
 
-    # GC management (Python's GC causes ~500ms stalls)
-    if step == 0:
-        gc.collect()
-        gc.freeze()
-        gc.disable()
-    elif (step + 1) % 5000 == 0:
-        gc.collect()
+    metrics = evaluate_reconstruction(predictions, split=args.split, dvlt_k=args.k, allow_test=args.allow_test)
+    if args.visual_audit:
+        save_visual_audit(predictions, split=args.split, dvlt_k=args.k, out_dir=args.visual_audit, allow_test=args.allow_test)
 
-    step += 1
+    total_refine_sec = float(np.sum(refine_times))
+    mean_refine_sec = float(np.mean(refine_times))
+    mean_sem_sec = float(np.mean(sem_times))
+    peak_vram_mb = (torch.cuda.max_memory_allocated() / 1024 / 1024) if use_cuda else 0.0
 
-    # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
-        break
+    print("---")
+    print(f"val_score:        {metrics['val_score']:.6f}")
+    print(f"cd_cm:            {metrics['cd_cm']:.4f}")
+    print(f"acc_cm:           {metrics['acc_cm']:.4f}")
+    print(f"comp_cm:          {metrics['comp_cm']:.4f}")
+    print(f"f1_2cm:           {metrics['f1_2cm']:.4f}")
+    print(f"f1_5cm:           {metrics['f1_5cm']:.4f}")
+    print(f"nae_deg:          {metrics['nae_deg']:.2f}")
+    print(f"edge_err_cm:      {metrics['edge_err_cm']:.4f}")
+    print(f"coverage:         {metrics['coverage']:.4f}")
+    print(f"refine_seconds:   {total_refine_sec:.1f}")
+    print(f"scene_seconds:    {mean_refine_sec:.2f}")
+    print(f"sem_extract_sec:  {mean_sem_sec:.2f}")
+    print(f"total_seconds:    {time.time() - t_start:.1f}")
+    print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
+    print(f"mode:             {args.mode}")
+    print(f"split:            {args.split}")
+    print(f"dvlt_k:           {args.k}")
 
-print()  # newline after \r training log
 
-total_tokens = step * TOTAL_BATCH_SIZE
-
-# Final eval
-model.eval()
-with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
-
-# Final summary
-t_end = time.time()
-startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
-
-print("---")
-print(f"val_bpb:          {val_bpb:.6f}")
-print(f"training_seconds: {total_training_time:.1f}")
-print(f"total_seconds:    {t_end - t_start:.1f}")
-print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-print(f"mfu_percent:      {steady_state_mfu:.2f}")
-print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
-print(f"num_steps:        {step}")
-print(f"num_params_M:     {num_params / 1e6:.1f}")
-print(f"depth:            {DEPTH}")
+if __name__ == "__main__":
+    main()
