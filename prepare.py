@@ -1125,7 +1125,7 @@ def cache_predicted_semantics(splits: dict[str, Any]) -> None:
         N, H, W, _ = rgb.shape
         torch.cuda.synchronize()
         t0 = time.time()
-        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
+        with torch.no_grad():
             inp = dproc(images=[Image.fromarray(rgb[vi]) for vi in range(N)], return_tensors="pt").to(dev)
             n_patches = (H // 14) * (W // 14)
             ft = F.normalize(dmod(**inp, **dino_kw).last_hidden_state[:, -n_patches:, :].float(), dim=-1)
