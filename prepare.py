@@ -1043,9 +1043,9 @@ def cache_predicted_semantics(splits: dict[str, Any]) -> None:
     dev = torch.device("cuda")
     buf: dict[str, dict[str, Any]] = {s: {"sem_extract_sec": {}} for s in todo}
 
-    # 3A: SAM 2
+    # 3A: SAM 2 (fp32 avoids fp16 boxes/scores dtype mismatch in torchvision.ops.nms; ~184MB model)
     print(f"[Stage 3A] Loading {SAM2_MODEL_ID}...")
-    sam = pipeline("mask-generation", model=SAM2_MODEL_ID, device=0, torch_dtype=torch.float16)
+    sam = pipeline("mask-generation", model=SAM2_MODEL_ID, device=0, dtype=torch.float32)
     for sid in todo:
         rgb = np.load(SCENES_DIR / sid / "rgb.npz")["rgb"]
         N, H, W, _ = rgb.shape
@@ -1069,6 +1069,7 @@ def cache_predicted_semantics(splits: dict[str, Any]) -> None:
         torch.cuda.synchronize()
         buf[sid]["sam_instance_id"], buf[sid]["sam_boundary"] = torch.from_numpy(s_inst), torch.from_numpy(s_bnd)
         buf[sid]["sem_extract_sec"]["sam_sec"] = float(time.time() - t0)
+        print(f"  [SAM2] {sid}: {buf[sid]['sem_extract_sec']['sam_sec']:.2f}s")
     del sam
     gc.collect()
     torch.cuda.empty_cache()
@@ -1087,19 +1088,20 @@ def cache_predicted_semantics(splits: dict[str, Any]) -> None:
         cids, cconf, sids_arr = np.zeros((N, H, W), np.int16), np.zeros((N, H, W), np.float16), np.zeros((N, H, W), np.uint8)
         torch.cuda.synchronize()
         t0 = time.time()
-        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
+        with torch.no_grad():
             for vi in range(N):
                 inp = sproc(images=Image.fromarray(rgb[vi]), return_tensors="pt").to(dev)
                 out = smod(**inp)
                 cid = sproc.post_process_semantic_segmentation(out, target_sizes=[(H, W)])[0].cpu().numpy().astype(np.int16)
                 cids[vi], sids_arr[vi] = cid, c2s[np.clip(cid, 0, max_c)]
-                cp = out.class_queries_logits[0].softmax(-1)[:, :-1]
-                mp = out.masks_queries_logits[0].sigmoid()
+                cp = out.class_queries_logits[0].float().softmax(-1)[:, :-1]
+                mp = out.masks_queries_logits[0].float().sigmoid()
                 sp = F.interpolate(torch.einsum("qc,qhw->chw", cp, mp).unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False)[0]
                 cconf[vi] = sp.max(0).values.clamp(0, 1).cpu().numpy().astype(np.float16)
         torch.cuda.synchronize()
         buf[sid]["sem_class_id"], buf[sid]["sem_class_conf"], buf[sid]["sem_struct_id"] = torch.from_numpy(cids), torch.from_numpy(cconf), torch.from_numpy(sids_arr)
         buf[sid]["sem_extract_sec"]["seg_sec"] = float(time.time() - t0)
+        print(f"  [Mask2Former] {sid}: {buf[sid]['sem_extract_sec']['seg_sec']:.2f}s")
     del smod, sproc
     gc.collect()
     torch.cuda.empty_cache()
@@ -1108,6 +1110,7 @@ def cache_predicted_semantics(splits: dict[str, Any]) -> None:
     print(f"[Stage 3C] Loading {DINO_MODEL_ID}...")
     dproc = AutoImageProcessor.from_pretrained(DINO_MODEL_ID, do_resize=False, do_center_crop=False)
     dmod = AutoModel.from_pretrained(DINO_MODEL_ID).to(dev).eval()
+    dino_kw = {"interpolate_pos_encoding": True} if "interpolate_pos_encoding" in inspect.signature(dmod.forward).parameters else {}
     for sid in todo:
         rgb = np.load(SCENES_DIR / sid / "rgb.npz")["rgb"]
         N, H, W, _ = rgb.shape
@@ -1115,7 +1118,7 @@ def cache_predicted_semantics(splits: dict[str, Any]) -> None:
         t0 = time.time()
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
             inp = dproc(images=[Image.fromarray(rgb[vi]) for vi in range(N)], return_tensors="pt").to(dev)
-            ft = F.normalize(dmod(**inp).last_hidden_state[:, 1:, :].float(), dim=-1)
+            ft = F.normalize(dmod(**inp, **dino_kw).last_hidden_state[:, 1:, :].float(), dim=-1)
             flat = ft.reshape(-1, ft.shape[-1])
             fc = flat - flat.mean(0, keepdim=True)
             _, _, V = torch.pca_lowrank(fc, q=min(DINO_PCA_DIM, flat.shape[-1]))
